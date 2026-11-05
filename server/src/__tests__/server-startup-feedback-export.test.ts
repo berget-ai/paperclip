@@ -17,6 +17,8 @@ const {
   deriveAuthTrustedOriginsMock,
   environmentCustomImagesServiceMock,
   environmentCustomImagesServiceFactoryMock,
+  executionWorkspaceServiceFactoryMock,
+  executionWorkspaceServiceMock,
   externalObjectsServiceMock,
   externalObjectsServiceFactoryMock,
   feedbackExportServiceMock,
@@ -73,12 +75,31 @@ const {
   const heartbeatServiceFactoryMock = vi.fn(() => heartbeatServiceMock);
   const issueThreadInteractionServiceMock = {
     sweepSupersededPendingRequestConfirmations: vi.fn(async () => ({ expired: 0 })),
+    sweepMergedPullRequestConfirmations: vi.fn(async () => ({
+      checked: 0,
+      candidates: 0,
+      accepted: 0,
+      woken: 0,
+    })),
   };
   const issueThreadInteractionServiceFactoryMock = vi.fn(() => issueThreadInteractionServiceMock);
   const environmentCustomImagesServiceMock = {
     cleanupExpiredSetupSessions: vi.fn(async () => ({ scanned: 0, timedOut: 0, failed: 0 })),
   };
   const environmentCustomImagesServiceFactoryMock = vi.fn(() => environmentCustomImagesServiceMock);
+  const executionWorkspaceServiceMock = {
+    sweepTerminalWorkspaces: vi.fn(async () => ({
+      checked: 0,
+      eligible: 0,
+      archived: 0,
+      cleanupFailed: 0,
+      skippedActiveRun: 0,
+      skippedNonTerminalTree: 0,
+      skippedUndelivered: 0,
+      skippedRace: 0,
+    })),
+  };
+  const executionWorkspaceServiceFactoryMock = vi.fn(() => executionWorkspaceServiceMock);
   const externalObjectsServiceMock = {
     refreshDueObjectsForActiveCompanies: vi.fn(async () => ({ companies: 0, checked: 0, refreshed: 0 })),
   };
@@ -110,6 +131,8 @@ const {
     deriveAuthTrustedOriginsMock,
     environmentCustomImagesServiceMock,
     environmentCustomImagesServiceFactoryMock,
+    executionWorkspaceServiceFactoryMock,
+    executionWorkspaceServiceMock,
     externalObjectsServiceMock,
     externalObjectsServiceFactoryMock,
     feedbackExportServiceMock,
@@ -138,6 +161,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     authBaseUrlMode: "auto",
     authPublicBaseUrl: undefined,
     authDisableSignUp: false,
+    ssoProviders: [],
     databaseMode: "postgres",
     databaseUrl: "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip",
     embeddedPostgresDataDir: "/tmp/paperclip-test-db",
@@ -241,6 +265,7 @@ vi.mock("../services/index.js", () => ({
   bootstrapExecutionPolicyFromEnv: vi.fn(async () => null),
   applyManagedEnvironments: vi.fn(async () => null),
   environmentCustomImageService: environmentCustomImagesServiceFactoryMock,
+  executionWorkspaceService: executionWorkspaceServiceFactoryMock,
   externalObjectService: externalObjectsServiceFactoryMock,
   heartbeatService: heartbeatServiceFactoryMock,
   issueThreadInteractionService: issueThreadInteractionServiceFactoryMock,
@@ -288,6 +313,12 @@ vi.mock("../services/index.js", () => ({
   })),
 }));
 
+vi.mock("../services/secret-proposals.js", () => ({
+  createSecretProposalsService: vi.fn(() => ({
+    sweepExpired: vi.fn(async () => 0),
+  })),
+}));
+
 vi.mock("../storage/index.js", () => ({
   createStorageServiceFromConfig: vi.fn(() => ({ id: "storage-service" })),
 }));
@@ -309,9 +340,33 @@ vi.mock("../board-claim.js", () => ({
   initializeBoardClaimChallenge: vi.fn(async () => undefined),
 }));
 
+vi.mock("../services/instance-settings.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/instance-settings.js")>();
+  return {
+    ...actual,
+    instanceSettingsService: vi.fn(() => ({
+      getSso: vi.fn(async () => ({ enabled: false, providers: [] })),
+      updateSso: vi.fn(),
+      getExperimental: vi.fn(async () => ({})),
+    })),
+  };
+});
+
 vi.mock("../auth/better-auth.js", () => ({
   createBetterAuthHandler: vi.fn(() => undefined),
   createBetterAuthInstance: createBetterAuthInstanceMock,
+  // Mirror the real manager: it builds its auth instance via
+  // createBetterAuthInstance, so assertions on createBetterAuthInstanceMock
+  // keep observing (db, config, trustedOrigins) through the manager path.
+  createBetterAuthManager: vi.fn((db: unknown, config: unknown, trustedOrigins: unknown) => {
+    createBetterAuthInstanceMock(db, config, trustedOrigins);
+    return {
+      handler: vi.fn(),
+      resolveSession: vi.fn(async () => null),
+      resolveSessionFromHeaders: vi.fn(async () => null),
+      rebuild: vi.fn(),
+    };
+  }),
   deriveAuthTrustedOrigins: deriveAuthTrustedOriginsMock,
   resolveBetterAuthSession: vi.fn(async () => null),
   resolveBetterAuthSessionFromHeaders: vi.fn(async () => null),
@@ -467,6 +522,8 @@ describe("startServer feedback export wiring", () => {
 
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
+      expect(issueThreadInteractionServiceMock.sweepMergedPullRequestConfirmations).toHaveBeenCalledTimes(1);
+      expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).toHaveBeenCalledTimes(1);
       expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(2);
     } finally {

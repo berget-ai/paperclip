@@ -60,6 +60,7 @@ import { ProfileDetailRoute } from "./pages/tools/profiles/ProfileDetailRoute";
 import { Connections } from "./pages/apps/Connections";
 import { Browse } from "./pages/apps/Browse";
 import { AppsConnect } from "./pages/apps/AppsConnect";
+import { canEnterAppsConnect } from "./pages/apps/app-connect-policy";
 import { AppsReview } from "./pages/apps/AppsReview";
 import { AppDetail } from "./pages/apps/AppDetail";
 import { AppNotConnected } from "./pages/apps/AppNotConnected";
@@ -76,6 +77,7 @@ import { InstanceGeneralSettings } from "./pages/InstanceGeneralSettings";
 import { InstanceAccess } from "./pages/InstanceAccess";
 import { InstanceSettings } from "./pages/InstanceSettings";
 import { InstanceExperimentalSettings } from "./pages/InstanceExperimentalSettings";
+import { InstanceSsoSettings } from "./pages/InstanceSsoSettings";
 import { ProfileSettings } from "./pages/ProfileSettings";
 import { PluginManager } from "./pages/PluginManager";
 import { PluginSettings } from "./pages/PluginSettings";
@@ -121,14 +123,15 @@ function boardRoutes() {
       <Route path="tools" element={<LegacyToolsRedirect />} />
       <Route path="tools/:tab" element={<LegacyToolsRedirect />} />
       <Route element={<AppsExperimentalGate />}>
-        <Route path="apps" element={<Connections />} />
-        <Route path="apps/browse" element={<Browse />} />
+        <Route path="apps" element={<Browse />} />
+        <Route path="apps/browse" element={<Navigate to="/apps" replace />} />
+        <Route path="apps/connections" element={<Connections />} />
         <Route path="apps/connect" element={<AppsConnectEntryRoute />} />
-        <Route path="apps/connect/:appKey" element={<Navigate to="/apps/browse" replace />} />
-        <Route path="apps/connect/:appKey/:stage" element={<Navigate to="/apps/browse" replace />} />
+        <Route path="apps/connect/:appKey" element={<Navigate to="/apps" replace />} />
+        <Route path="apps/connect/:appKey/:stage" element={<Navigate to="/apps" replace />} />
         <Route path="apps/review" element={<AppsReview />} />
         {/* Needs attention folded into Connections (PAP-13254); keep legacy links working. */}
-        <Route path="apps/attention" element={<Navigate to="/apps" replace />} />
+        <Route path="apps/attention" element={<Navigate to="/apps/connections" replace />} />
         <Route path="apps/gateways" element={<GatewaysList />} />
         <Route path="apps/gateways/:gatewayId" element={<Navigate to="overview" replace />} />
         <Route path="apps/gateways/:gatewayId/:tab" element={<GatewayDetail />} />
@@ -150,6 +153,7 @@ function boardRoutes() {
       <Route path="company/settings/instance/environments/:environmentId/edit" element={<CompanyEnvironments mode="edit" />} />
       <Route path="company/settings/instance/access" element={<InstanceAccess />} />
       <Route path="company/settings/instance/heartbeats" element={<InstanceSettings />} />
+      <Route path="company/settings/instance/sso" element={<InstanceSsoSettings />} />
       <Route path="company/settings/instance/experimental" element={<InstanceExperimentalSettings />} />
       <Route path="company/settings/instance/plugins" element={<PluginManager />} />
       <Route path="company/settings/instance/plugins/:pluginId" element={<PluginSettings />} />
@@ -308,7 +312,7 @@ function boardRoutes() {
 function AppsConnectEntryRoute() {
   const location = useLocation();
   const searchParams = new URLSearchParams(location.search);
-  return searchParams.get("byo") === "1" ? <AppsConnect /> : <Navigate to="/apps/browse" replace />;
+  return canEnterAppsConnect(searchParams) ? <AppsConnect /> : <Navigate to="/apps" replace />;
 }
 
 function InboxRootRedirect() {
@@ -402,7 +406,7 @@ function LegacyToolsRedirect() {
 
 function legacyToolsRedirectTarget(tab?: string) {
   if (!tab) return "/apps/advanced/profiles";
-  if (tab === "applications" || tab === "connections" || tab === "overview" || tab === "examples") return "/apps";
+  if (tab === "applications" || tab === "connections" || tab === "overview" || tab === "examples") return "/apps/connections";
   return `/apps/advanced/${tab}`;
 }
 

@@ -50,6 +50,7 @@ import {
   decisionService,
   decisionRetentionService,
   externalObjectService,
+  executionWorkspaceService,
   heartbeatService,
   issueThreadInteractionService,
   issueService,
@@ -62,6 +63,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
+import { createSecretProposalsService } from "./services/secret-proposals.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
   parseAdapterRegistryEnv,
@@ -560,6 +562,7 @@ export async function startServer(): Promise<StartedServer> {
   let resolveSessionFromHeaders:
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
+  let onSsoSettingsChanged: ((providers: import("@paperclipai/shared").SsoProviderConfig[]) => void) | undefined;
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
@@ -578,12 +581,16 @@ export async function startServer(): Promise<StartedServer> {
   }
   if (config.deploymentMode === "authenticated") {
     const {
-      createBetterAuthHandler,
-      createBetterAuthInstance,
       deriveAuthTrustedOrigins,
-      resolveBetterAuthSession,
-      resolveBetterAuthSessionFromHeaders,
     } = await import("./auth/better-auth.js");
+    const { instanceSettingsService: createSsoSvc } = await import("./services/instance-settings.js");
+    const betterAuthSecret =
+      process.env.BETTER_AUTH_SECRET?.trim() ?? process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
+    if (!betterAuthSecret) {
+      throw new Error(
+        "authenticated mode requires BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET) to be set",
+      );
+    }
     const derivedTrustedOrigins = deriveAuthTrustedOrigins(config, { listenPort });
     const envTrustedOrigins = (process.env.BETTER_AUTH_TRUSTED_ORIGINS ?? "")
       .split(",")
@@ -602,10 +609,32 @@ export async function startServer(): Promise<StartedServer> {
       },
       "Authenticated mode auth origin configuration",
     );
-    const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
-    betterAuthHandler = createBetterAuthHandler(auth);
-    resolveSession = (req) => resolveBetterAuthSession(auth, req);
-    resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
+
+    const {
+      createBetterAuthManager,
+    } = await import("./auth/better-auth.js");
+    const ssoSvc = createSsoSvc(db as any);
+    const dbSsoSettings = await ssoSvc.getSso();
+    const initialSsoProviders = dbSsoSettings.enabled && dbSsoSettings.providers.length > 0
+      ? dbSsoSettings.providers
+      : config.ssoProviders;
+    config.ssoProviders = initialSsoProviders;
+
+    if (config.ssoProviders.length > 0) {
+      const publicBase = (config.authPublicBaseUrl ?? `http://localhost:${config.port}`).replace(/\/+$/, "");
+      logger.info(
+        {
+          providers: config.ssoProviders.map((p) => p.providerId),
+          callbackUrlPattern: `${publicBase}/api/auth/oauth2/callback/{providerId}`,
+        },
+        "SSO providers configured",
+      );
+    }
+    const authManager = createBetterAuthManager(db as any, config, effectiveTrustedOrigins);
+    betterAuthHandler = authManager.handler;
+    resolveSession = (req) => authManager.resolveSession(req);
+    resolveSessionFromHeaders = (headers) => authManager.resolveSessionFromHeaders(headers);
+    onSsoSettingsChanged = (providers) => authManager.rebuild(providers);
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
     authReady = true;
   }
@@ -761,9 +790,11 @@ export async function startServer(): Promise<StartedServer> {
     bindHost: config.host,
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
+    ssoProviders: config.ssoProviders,
     pluginMigrationDb: pluginMigrationDb as any,
     betterAuthHandler,
     resolveSession,
+    onSsoSettingsChanged,
     pluginWorkerManager,
     decisionServiceOptions,
     managedPluginAutoInstall,
@@ -957,6 +988,7 @@ export async function startServer(): Promise<StartedServer> {
   };
 
   if (heartbeat) {
+    const secretProposals = createSecretProposalsService(db as any);
     const decisionExecutor = decisionService(db as any, decisionServiceOptions);
     const retentionExecutor = decisionRetentionService(db as any, {
       notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
@@ -969,6 +1001,36 @@ export async function startServer(): Promise<StartedServer> {
     const routines = routineService(db as any, { pluginWorkerManager });
     const statusCards = statusCardService(db as any);
     const issues = issueService(db as any);
+    const mergedPullRequestConfirmations = issueThreadInteractionService(db as any, {
+      wakeup: heartbeat.wakeup,
+    });
+    const terminalWorkspaces = executionWorkspaceService(db as any);
+    const scheduleMergedPullRequestConfirmationSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(mergedPullRequestConfirmations
+        .sweepMergedPullRequestConfirmations()
+        .then((result) => {
+          if (result.accepted > 0) {
+            logger.info(result, "accepted merge confirmations for merged pull requests");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "merged pull-request confirmation sweep failed");
+        }));
+    };
+    const scheduleTerminalWorkspaceSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(terminalWorkspaces
+        .sweepTerminalWorkspaces()
+        .then((result) => {
+          if (result.archived > 0 || result.cleanupFailed > 0) {
+            logger.info(result, "terminal issue workspace reaper changed workspace state");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "terminal issue workspace reaper failed");
+        }));
+    };
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -1100,18 +1162,15 @@ export async function startServer(): Promise<StartedServer> {
       const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
       let archived = 0;
       for (const company of activeCompanies) {
-        const items = [];
-        let cursor: string | undefined;
-        do {
-          const page = await attentionService(db as any).list(company.id, {
-            includeDismissed: true,
-            limit: 100,
-            cursor,
-          });
-          items.push(...page.items);
-          cursor = page.nextCursor ?? undefined;
-        } while (cursor);
-        archived += await retentionExecutor.autoArchive({ companyId: company.id, items });
+        // Cursor pagination rebuilds the whole feed for every page; one
+        // unscoped all-items build keeps this sweep at a single feed build
+        // per company per tick.
+        const page = await attentionService(db as any).list(company.id, {
+          includeDismissed: true,
+          all: true,
+          allowUnscopedAll: true,
+        });
+        archived += await retentionExecutor.autoArchive({ companyId: company.id, items: page.items });
       }
       const notifications = await retentionExecutor.deliverNotifications();
       return { archived, ...notifications };
@@ -1153,6 +1212,10 @@ export async function startServer(): Promise<StartedServer> {
 
         if (heartbeatSchedulerStopped) return;
         scheduleExternalObjectRefreshSweep(new Date());
+
+        if (heartbeatSchedulerStopped) return;
+        scheduleMergedPullRequestConfirmationSweep();
+        scheduleTerminalWorkspaceSweep();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
@@ -1217,6 +1280,14 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "periodic tool connection health sweep failed");
+          }));
+
+        trackHeartbeatSchedulerWork(secretProposals.sweepExpired()
+          .then((expired) => {
+            if (expired > 0) logger.warn({ expired }, "periodic secret proposal expiry scrubbed proposals");
+          })
+          .catch((err) => {
+            logger.error({ err }, "periodic secret proposal expiry sweep failed");
           }));
 
         if (heartbeatSchedulerStopped) return;
