@@ -76,8 +76,12 @@ WORKDIR /app
 # the app copy changes on every commit — ordered the other way around, this
 # (the single most expensive layer: four CLI toolchains + apt, per arch) can
 # never hit the layer cache and rebuilds on every build.
+# opencode-ai is pinned to the 1.x line: the guardrails-md opencode plugin
+# hooks opencode's plugin API, which differs between 1.x and 2.x, and only
+# 1.x is verified. Minor/patch releases still advance weekly via
+# CLI_TOOLS_CACHE_EPOCH; raise the floor only on verified releases.
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
-  && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest \
+  && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai@^1.19.5 @google/gemini-cli@latest \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
   && rm -rf /var/lib/apt/lists/* \
